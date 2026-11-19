@@ -1,0 +1,10 @@
+microparquet
+Copyright 2026 the microparquet authors
+
+Licensed under the Apache License, Version 2.0; see LICENSE.
+
+microparquet is an independent implementation of the Apache Parquet file
+format. It is not affiliated with, endorsed by, or sponsored by the Apache
+Software Foundation. Apache Parquet, Parquet, and the Parquet logo are either
+registered trademarks or trademarks of the Apache Software Foundation in the
+United States and other countries.

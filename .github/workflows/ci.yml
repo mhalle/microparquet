@@ -1,0 +1,99 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+
+# A new push to a pull request cancels that PR's older run. Pushes to main and
+# tags are never cancelled: each is the record for its commit.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Read-only by default; the publish job asks for its OIDC token itself.
+permissions:
+  contents: read
+
+jobs:
+  # The library promises: standard library only, Python 3.9+. Test exactly that,
+  # with nothing installed but pytest, with and without accelerators disabled.
+  unit:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        exclude:
+          - {os: macos-latest, python: "3.10"}
+          - {os: macos-latest, python: "3.11"}
+          - {os: macos-latest, python: "3.12"}
+          - {os: macos-latest, python: "3.13"}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+      - name: Install
+        run: |
+          uv venv --python ${{ matrix.python }} .venv
+          uv pip install --python .venv/bin/python pytest
+      - name: Standard library only
+        run: .venv/bin/pytest -m unit -q
+      - name: Pure Python (MICROPARQUET_PURE=1)
+        run: MICROPARQUET_PURE=1 .venv/bin/pytest -m unit -q
+      - name: With cramjam and zstandard
+        run: |
+          uv pip install --python .venv/bin/python cramjam zstandard
+          .venv/bin/pytest -m unit -q
+
+  # Agreement with other engines, fuzzing, and apache/parquet-testing.
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          repository: apache/parquet-testing
+          path: parquet-testing
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+      - name: Install
+        run: |
+          uv venv --python 3.14 .venv
+          uv pip install --python .venv/bin/python -e . --group test cramjam
+      - name: Lint
+        run: .venv/bin/ruff check .
+      - name: Interop and fuzzing
+        run: .venv/bin/pytest -m interop -q
+      - name: apache/parquet-testing
+        run: PARQUET_TESTING=parquet-testing/data .venv/bin/pytest -m external -q
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [unit, interop]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+      - run: uv build
+      - run: uvx twine==7.0.0 check --strict dist/*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    # Tags alone do not publish: set the repository variable PUBLISH_PYPI=true
+    # (Settings > Secrets and variables > Actions > Variables) once the `pypi`
+    # environment and PyPI trusted publisher exist, then push the tag.
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_PYPI == 'true'
+    runs-on: ubuntu-latest
+    needs: build
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3

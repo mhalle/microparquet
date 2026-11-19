@@ -1,0 +1,87 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "microparquet"
+dynamic = ["version"]
+description = "A small, dependency-free Parquet reader and writer in one pure-Python file."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.9"
+authors = [{ name = "the microparquet authors" }]
+keywords = ["parquet", "columnar", "pure-python", "zero-dependency", "http-range"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Database",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# Never required. cramjam gives C-speed snappy/LZ4/Brotli/zstd in one small wheel;
+# zstandard reads and writes zstd on Python < 3.14 (3.14+ has compression.zstd).
+fast = ["cramjam>=2.8"]
+zstd = ["zstandard>=0.22; python_version < '3.14'"]
+
+# Test dependencies are a PEP 735 group, not a published extra.
+#   uv pip install -e . --group test      or      pip install -e . --group test
+[dependency-groups]
+test = [
+  "pytest>=8",
+  "ruff",
+  "pyarrow>=17",
+  "polars",
+  "duckdb",
+  "pytz",
+  "fastparquet",
+  "pandas",
+]
+
+[project.urls]
+Homepage = "https://github.com/mhalle/microparquet"
+Changelog = "https://github.com/mhalle/microparquet/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "microparquet.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["microparquet.py", "tests", "tools", "docs", ".github", "README.md", "CHANGELOG.md", "SECURITY.md", "LICENSE", "NOTICE"]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["microparquet.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_scripts.py"]   # the other files are runnable scripts, driven by test_scripts.py
+markers = [
+  "unit: standard library only, no optional dependencies",
+  "interop: compares against pyarrow, polars, DuckDB and fastparquet",
+  "external: needs a clone of apache/parquet-testing (PARQUET_TESTING=.../data)",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+# The module is written densely on purpose (one file, read top to bottom):
+# compound statements and %-formatting are style, not bugs.
+ignore = ["E401", "E402", "E501", "E701", "E702", "E731", "E741", "B007", "UP031"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test and tool scripts: lambdas are called inside the loop that defines them.
+"tests/*" = ["B023", "B904", "UP"]
+"tools/*" = ["B023", "UP"]
