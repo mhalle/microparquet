@@ -74,6 +74,8 @@ markers = [
 [tool.ruff]
 line-length = 120
 target-version = "py39"
+# CI clones apache/parquet-testing into the checkout; it is not our code.
+extend-exclude = ["parquet-testing"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B", "UP"]
