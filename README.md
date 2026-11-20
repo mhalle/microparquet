@@ -54,16 +54,21 @@ A path (`str` or `Path`) is always a local file, even when it looks like a URL. 
 mpq.write("out.parquet", {"id": [3, 1, 2], "tags": [["a"], [], None]}, sort_by="id")
 mpq.write("out.parquet", [{"a": 1}, {"b": "x"}])                  # a list of row dicts works too
 
-with mpq.ParquetWriter("big.parquet", types={"price": "decimal(10,2)", "at": "timestamp[ms,UTC]"}) as w:
+types = {"price": "decimal(10,2)", "at": "timestamp[ms,UTC]", "user": "struct<name: string, roles: list<string>>"}
+with mpq.ParquetWriter("big.parquet", types) as w:
     for batch in batches:
-        w.write(batch)                                             # bounded memory
+        w.write(batch)                          # buffered: many small batches still make full row groups
+
+mpq.write("copy.parquet", mpq.ParquetFile("in.parquet").read(dictionaries=True))
 ```
 
 The writer covers the common cases. Its files read well in microparquet itself and in pyarrow, polars, DuckDB and fastparquet.
 
-- **Types are inferred** from Python values: bool, int, float, str, bytes, date, datetime (naive or timezone-aware), time, Decimal, UUID, lists, and dicts as structs, nested to any depth. You can also name types in `types=`: `int8`…`uint64`, `float32`, `float64`, `string`, `json`, `binary`, `bool`, `date`, `time[ms|us|ns]`, `timestamp[ms|us|ns(,UTC)]`, `decimal(p,s)`, `uuid`, `null`, `list<…>`.
-- **Files are laid out for fast reads.** Each file gets statistics, a page index, and dictionary encoding where it pays. The defaults are zstd level 3 compression (gzip where zstd isn't available), 64 KB pages, and 64K-row groups. `sort_by` records the sort order in the file; sort by the column you filter on most.
-- **Values are checked strictly.** A value of the wrong type or out of range raises an error, and the batch is undone. The file appears atomically, only when the writer closes cleanly.
+- **Types are inferred** from the first batch that has rows. Recognized Python values: bool, int, float, str, bytes, date, datetime (naive or timezone-aware), time, Decimal, UUID, lists, and dicts as structs, nested to any depth. You can also name types in `types=`: `int8`…`uint64`, `float32`, `float64`, `string`, `json`, `binary`, `bool`, `date`, `time[ms|us|ns]`, `timestamp[ms|us|ns(,UTC)]`, `decimal(p,s)`, `uuid`, `null`, `list<…>`, `struct<name: type, …>`. Name the type of any column that may hold only nulls in the first batch.
+- **Columns** can be lists, tuples, `array.array`, `DictionaryColumn`, or anything with a `tolist()` method, such as a numpy array. Arrays skip the per-value checks. Dictionary values are converted once per entry rather than once per row, so `read(dictionaries=True)` output writes back quickly. `read(arrays=True)` gives dates and timestamps as raw numbers, so name their types when writing that output back.
+- **Rows are buffered into row groups** of `row_group_size` rows (65,536 by default), or fewer once they reach `row_group_bytes` (128 MB by default, estimated). `sort_by` sorts each row group and records the order in the file. A single `write()` call gives a fully sorted file.
+- **Files are laid out for fast reads.** Each file gets statistics, a page index, and dictionary encoding where it pays. The defaults are zstd level 3 compression (gzip where zstd isn't available) and 64 KB pages.
+- **Values are checked strictly.** A value of the wrong type or out of range raises an error. The rejected batch is undone, and so is a batch whose row groups fail to write. The file appears atomically, only when the writer closes cleanly.
 - **Not written:** maps, INT96, the delta and byte-stream-split encodings, v2 data pages, bloom filters.
 
 ## Optional accelerators
@@ -100,7 +105,7 @@ The figures below were measured while developing microparquet, on one machine; s
 ```
 pip install -e . --group test
 pytest -m unit          # standard library only: the writer and reader against each other, HTTP, filters
-pytest -m interop       # against pyarrow, polars, DuckDB and fastparquet, plus fuzzing
+pytest -m interop       # against pyarrow, polars, DuckDB and fastparquet, plus fuzzing (filters, malformed files, writer faults)
 PARQUET_TESTING=../parquet-testing/data pytest -m external
 ```
 

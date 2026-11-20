@@ -2,7 +2,7 @@
 # Bad inputs, type mismatches, failure atomicity and odd-but-legal tables for the writer.
 import sys, os, io, math, decimal, datetime as dt, glob, traceback
 sys.path.insert(0, sys.argv[1]); import microparquet as mpq
-import pyarrow.parquet as pq
+import pyarrow as pa, pyarrow.parquet as pq   # pa.BufferReader: pyarrow can hang at exit after reading a BytesIO
 T = sys.argv[2]; os.makedirs(T, exist_ok=True)
 fails = 0
 def ok(label, cond, detail=''):
@@ -143,6 +143,156 @@ try: w.write({'a': [1, 'x']})
 except TypeError: pass
 w.write({'b': ['ok']}); w.close()
 ok('schema after failed first batch', {k: list(v) for k, v in mpq.read(P('refirst.parquet')).items()} == {'b': ['ok']})
+
+# -- streaming: buffering, columnar inputs, row-group limits (session 7)
+from array import array
+import random
+def rd(p): return {k: list(v) for k, v in mpq.read(p).items()}
+
+# many small batches become full row groups, not one row group per batch
+with mpq.ParquetWriter(P('many.parquet'), row_group_size=1000) as w:
+    for i in range(250): w.write({'a': list(range(i * 10, i * 10 + 10))})
+md = pq.ParquetFile(P('many.parquet')).metadata
+ok('small batches -> full row groups', [md.row_group(i).num_rows for i in range(md.num_row_groups)] == [1000, 1000, 500])
+ok('small batches values', rd(P('many.parquet'))['a'] == list(range(2500)))
+
+# a bad batch after buffered (not yet written) rows is dropped; buffered rows survive
+w = mpq.ParquetWriter(P('buf.parquet'), row_group_size=100)
+w.write({'a': [1, 2], 's': ['x', 'y']})
+for bad in ({'a': [3], 's': [4]}, {'a': ['q'], 's': ['z']}, {'a': [2**64], 's': ['z']}, {'s': ['z'], 'a': [1]}):
+    try: w.write(bad); ok('bad buffered batch accepted %r' % bad, False)
+    except (TypeError, ValueError, OverflowError): pass
+w.write({'a': [5], 's': [None]}); w.close()
+ok('buffered rows kept after rejected batches', rd(P('buf.parquet')) == {'a': [1, 2, 5], 's': ['x', 'y', None]}, rd(P('buf.parquet')))
+
+# a write that fails while flushing (I/O error part way) is undone, file and buffer
+class Flaky(io.BytesIO):
+    def __init__(self): super().__init__(); self.calls = 0; self.fail_at = None
+    def write(self, b):
+        self.calls += 1
+        if self.fail_at is not None and self.calls == self.fail_at: raise OSError('disk full (simulated)')
+        return super().write(b)
+for fail_after in (1, 3, 5, 8):          # the batch makes 2 row groups x 2 columns x 2 writes
+    f = Flaky(); w = mpq.ParquetWriter(f, row_group_size=50)
+    w.write({'a': list(range(30)), 's': ['v%d' % i for i in range(30)]})            # buffered only
+    f.fail_at = f.calls + fail_after
+    try: w.write({'a': list(range(30, 130)), 's': ['v%d' % i for i in range(30, 130)]}); ok('flaky write %d raised' % fail_after, False)
+    except OSError: pass
+    f.fail_at = None
+    w.write({'a': list(range(200, 260)), 's': ['w%d' % i for i in range(60)]}); w.close()
+    got = {k: list(v) for k, v in mpq.read(f.getvalue()).items()}
+    ok('flaky write %d undone' % fail_after, got == {'a': list(range(30)) + list(range(200, 260)), 's': ['v%d' % i for i in range(30)] + ['w%d' % i for i in range(60)]}, {k: v[:5] for k, v in got.items()})
+    pa_ok = pq.read_table(pa.BufferReader(f.getvalue()), use_threads=False).num_rows == 90
+    ok('flaky write %d: pyarrow reads the result' % fail_after, pa_ok)
+
+# KeyboardInterrupt while flushing: same undo
+class Interrupt(io.BytesIO):
+    armed = False
+    def write(self, b):
+        if self.armed: self.armed = False; raise KeyboardInterrupt
+        return super().write(b)
+f = Interrupt(); w = mpq.ParquetWriter(f, row_group_size=10)
+w.write({'a': list(range(5))}); f.armed = True
+try: w.write({'a': list(range(5, 25))})
+except KeyboardInterrupt: pass
+w.write({'a': [99]}); w.close()
+ok('interrupted flush undone', list(mpq.read(f.getvalue())['a']) == [0, 1, 2, 3, 4, 99])
+
+# sort_by across buffered batches keeps rows together, nested columns included
+R = random.Random(3); rows = [(R.randint(0, 40), [R.randint(0, 9) for _ in range(R.randint(0, 3))], {'x': R.choice([None, 'p', 'q'])}) for _ in range(700)]
+with mpq.ParquetWriter(P('sorted.parquet'), sort_by='k', row_group_size=256) as w:
+    for i in range(0, 700, 37):
+        part = rows[i:i + 37]; w.write({'k': [r[0] for r in part], 'l': [r[1] for r in part], 'st': [r[2] for r in part]})
+got = rd(P('sorted.parquet')); md = pq.ParquetFile(P('sorted.parquet')).metadata
+ok('sorted batches: same rows', sorted(map(repr, zip(got['k'], got['l'], got['st']))) == sorted(map(repr, rows)))
+starts = [0]
+for i in range(md.num_row_groups): starts.append(starts[-1] + md.row_group(i).num_rows)
+ok('sorted batches: each row group sorted', all(got['k'][a:b] == sorted(got['k'][a:b]) for a, b in zip(starts, starts[1:])))
+ok('sorted batches: full row groups', [md.row_group(i).num_rows for i in range(md.num_row_groups)] == [256, 256, 188])
+
+# row_group_bytes splits wide data; a single row larger than the limit is its own group
+mpq.write(P('bytes.parquet'), {'s': ['x' * 1000] * 50, 'i': list(range(50))}, row_group_bytes=10_000)
+md = pq.ParquetFile(P('bytes.parquet')).metadata
+ok('row_group_bytes splits', md.num_row_groups > 1 and all(md.row_group(i).num_rows <= 10 for i in range(md.num_row_groups)), [md.row_group(i).num_rows for i in range(md.num_row_groups)])
+ok('row_group_bytes values', rd(P('bytes.parquet'))['i'] == list(range(50)))
+mpq.write(P('huge.parquet'), {'s': ['y' * 100_000, 'z']}, row_group_bytes=10)
+ok('row larger than row_group_bytes', rd(P('huge.parquet'))['s'] == ['y' * 100_000, 'z'] and pq.ParquetFile(P('huge.parquet')).metadata.num_row_groups == 2)
+raises('row_group_bytes 0', ValueError, lambda: mpq.ParquetWriter(P('x.parquet'), row_group_bytes=0))
+
+# array.array inputs: typecodes, ranges, declared types
+for tc in 'bBhHiIlLqQfd':
+    a = array(tc, [0, 1, 2, 100] if tc not in 'fd' else [0.5, -1.0, float('inf'), float('nan')])
+    mpq.write(P('arr.parquet'), {'a': a})
+    got = rd(P('arr.parquet'))['a']
+    ok('array %s round trip' % tc, repr(got) == repr(a.tolist()), (got, a.tolist()))
+mpq.write(P('arrq.parquet'), {'a': array('Q', [0, 2**64 - 1])})
+ok('array Q -> uint64', rd(P('arrq.parquet'))['a'] == [0, 2**64 - 1] and str(pq.read_schema(P('arrq.parquet')).field('a').type) == 'uint64')
+raises('array Q into int64', ValueError, lambda: mpq.write(P('bad.parquet'), {'a': array('Q', [2**63])}, {'a': 'int64'}))
+raises('array q into uint64', ValueError, lambda: mpq.write(P('bad.parquet'), {'a': array('q', [-1])}, {'a': 'uint64'}))
+raises('array i into int8', ValueError, lambda: mpq.write(P('bad.parquet'), {'a': array('i', [300])}, {'a': 'int8'}))
+raises('array B into int8', ValueError, lambda: mpq.write(P('bad.parquet'), {'a': array('B', [200])}, {'a': 'int8'}))
+raises('array d into float32 overflow', OverflowError, lambda: mpq.write(P('bad.parquet'), {'a': array('d', [1e300])}, {'a': 'float32'}))
+raises('array into string column', TypeError, lambda: mpq.write(P('bad.parquet'), {'a': array('q', [1])}, {'a': 'string'}))
+import warnings
+with warnings.catch_warnings():
+    warnings.simplefilter('ignore', DeprecationWarning)
+    raises('array u typecode', TypeError, lambda: mpq.write(P('bad.parquet'), {'a': array('u', 'ab')}))
+mpq.write(P('arrf.parquet'), {'a': array('f', [1.5, -0.0])}, {'a': 'float64'})
+ok('array f into float64', repr(rd(P('arrf.parquet'))['a']) == repr([1.5, -0.0]))
+
+# DictionaryColumn inputs, including what read(dictionaries=True) returns
+DC = mpq.DictionaryColumn
+mpq.write(P('dc.parquet'), {'s': DC(array('i', [1, -1, 0, 1]), ['a', 'b'])})
+ok('DictionaryColumn round trip', rd(P('dc.parquet'))['s'] == ['b', None, 'a', 'b'])
+raises('DictionaryColumn index too big', ValueError, lambda: mpq.write(P('bad.parquet'), {'s': DC(array('i', [2]), ['a', 'b'])}))
+raises('DictionaryColumn index < -1', ValueError, lambda: mpq.write(P('bad.parquet'), {'s': DC(array('i', [-2]), ['a'])}))
+raises('DictionaryColumn wrong value type', TypeError, lambda: mpq.write(P('bad.parquet'), {'s': DC(array('i', [0]), ['a', 5])}, {'s': 'string'}))
+raises('DictionaryColumn length mismatch', ValueError, lambda: mpq.write(P('bad.parquet'), {'s': DC(array('i', [0, 0]), ['a']), 'i': [1]}))
+mpq.write(P('dcn.parquet'), {'s': DC([0, 1, 0], ['a', None])})
+ok('DictionaryColumn with None entry', rd(P('dcn.parquet'))['s'] == ['a', None, 'a'])
+mpq.write(P('dce.parquet'), {'s': DC(array('i'), [])})
+ok('empty DictionaryColumn', rd(P('dce.parquet'))['s'] == [])
+src = mpq.ParquetFile(P('stream.parquet')).read(dictionaries=True, arrays=True)
+mpq.write(P('reread.parquet'), src)
+ok('read(dictionaries=True, arrays=True) writes back', rd(P('reread.parquet')) == rd(P('stream.parquet')))
+
+# empty first batches do not fix the types; all-null first batches say what to do
+with mpq.ParquetWriter(P('emptyfirst.parquet')) as w:
+    w.write({'a': [], 's': []}); w.write({'a': [1], 's': ['x']})
+ok('empty first batch defers types', rd(P('emptyfirst.parquet')) == {'a': [1], 's': ['x']} and str(pq.read_schema(P('emptyfirst.parquet')).field('a').type) == 'int64')
+with mpq.ParquetWriter(P('onlyempty.parquet')) as w: w.write({'a': []})
+ok('only empty batches: column kept', mpq.ParquetFile(P('onlyempty.parquet')).column_names == ['a'])
+w = mpq.ParquetWriter(io.BytesIO()); w.write({'a': []})
+msg = raises('empty batch then other columns', ValueError, lambda: w.write({'b': [1]})); w.abort()
+w = mpq.ParquetWriter(io.BytesIO()); w.write({'a': [None]})
+msg = raises('all-null first batch, then values', TypeError, lambda: w.write({'a': [1]})); w.abort()
+ok('all-null message points to types=', msg is not None and 'types=' in msg, msg)
+
+# numpy/pandas-like objects with tolist(), tuples, and bad type specs
+class FakeNumpy:
+    def __init__(self, v): self.v = v
+    def __len__(self): return len(self.v)
+    def tolist(self): return list(self.v)
+mpq.write(P('np.parquet'), {'a': FakeNumpy([1, 2]), 't': (3, 4)})
+ok('tolist() and tuple columns', rd(P('np.parquet')) == {'a': [1, 2], 't': [3, 4]})
+raises('type spec object', TypeError, lambda: mpq.write(P('bad.parquet'), {'a': [1]}, {'a': int}))
+raises('type spec tuple', TypeError, lambda: mpq.write(P('bad.parquet'), {'a': [1]}, {'a': ('list', 'int64')}))
+
+# struct type names
+mpq.write(P('stt.parquet'), {'m': [None, {'Role': 'u', 'Tags': ['a', None], 'p': None}, {}]},
+          {'m': 'struct<Role: string, Tags: list<string>, p: decimal(10, 2)>'})
+ok('struct type name', rd(P('stt.parquet'))['m'] == [None, {'Role': 'u', 'Tags': ['a', None], 'p': None}, {'Role': None, 'Tags': None, 'p': None}])
+ok('struct type name schema', str(pq.read_schema(P('stt.parquet')).field('m').type) == 'struct<Role: string, Tags: list<element: string>, p: decimal128(10, 2)>')
+for spec in ('struct<>', 'struct<a>', 'struct<a: int64, a: string>', 'struct<a: list<int64>', 'struct<: int64>', 'list<>', 'struct<a: nope>'):
+    raises('bad type name %r' % spec, (ValueError, TypeError), lambda: mpq.write(P('bad.parquet'), {'m': [None]}, {'m': spec}))
+raises('struct type, non-dict value', TypeError, lambda: mpq.write(P('bad.parquet'), {'m': [5]}, {'m': 'struct<a: int64>'}))
+raises('struct field dotted collision', ValueError, lambda: mpq.write(P('bad.parquet'), {'m.a': [1], 'm': [None]}, {'m': 'struct<a: int64>'}))
+
+# binary sort keys given as memoryview/bytearray (memoryview does not sort)
+with mpq.ParquetWriter(P('mv.parquet'), sort_by='b', row_group_size=4) as w:
+    for i in range(5): w.write({'b': [memoryview(b'z%d' % i), bytearray(b'a%d' % i), None], 'i': [i, i, i]})
+got = rd(P('mv.parquet'))
+ok('memoryview sort keys', sorted(map(repr, zip(got['b'], got['i']))) == sorted(map(repr, [(x, i) for i in range(5) for x in (b'z%d' % i, b'a%d' % i, None)])))
 
 # -- file objects as destinations
 buf = io.BytesIO(); mpq.write(buf, {'a': [1, 2]})

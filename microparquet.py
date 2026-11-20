@@ -70,11 +70,14 @@ elsewhere (checked against pyarrow, polars, DuckDB and fastparquet):
     mpq.write("out.parquet", {"id": [1, 2], "tags": [["a"], []]}, sort_by="id")
     mpq.write("out.parquet", rows)                  # or a list of row dicts
     with mpq.ParquetWriter("big.parquet", types={"price": "decimal(10,2)"}) as w:
-        for batch in batches: w.write(batch)        # bounded memory
+        for batch in batches: w.write(batch)        # buffered into full row groups
+    mpq.write("copy.parquet", pf.read(dictionaries=True))
 
 Types are inferred from Python values (bool, int, float, str, bytes, date,
 datetime naive or aware, time, Decimal, UUID, lists, dicts as structs) or named
-in types=. Files get statistics, a page index, dictionary encoding where it pays,
+in types= ("struct<a: int64, b: list<string>>" and the like). Columns may be
+lists, array.array or DictionaryColumn. Files get statistics, a page index,
+dictionary encoding where it pays,
 zstd compression (gzip where zstd is unavailable) and v1 data pages. Values are
 checked strictly against the column type; a rejected batch leaves the file as it
 was, and the file appears (atomically) only when the writer closes cleanly.
@@ -1643,10 +1646,32 @@ def _decimal_type(p, s):
 def _time_logical(code, utc, unit):
     return [(code, _T_STRUCT, [(1, _T_BOOL, bool(utc)), (2, _T_STRUCT, [(_UNIT[unit][0], _T_STRUCT, [])])])]
 
+def _split_top(s):
+    """Split s at commas that are not inside <>, () or []."""
+    out, depth, cur = [], 0, ""
+    for ch in s:
+        if ch in "<([": depth += 1
+        elif ch in ">)]": depth -= 1
+        if ch == "," and depth == 0: out.append(cur); cur = ""
+        else: cur += ch
+    if depth: raise ValueError("unbalanced brackets in type %r" % s)
+    return out + [cur]
+
 def _named_type(spec):
-    """'int32', 'string', 'decimal(10,2)', 'timestamp[ms,UTC]', 'list<string>', ..."""
-    s = spec.strip().lower().replace(" ", "")
-    if s.startswith("list<") and s.endswith(">"): return ("list", _named_type(s[5:-1]))
+    """'int32', 'string', 'decimal(10,2)', 'timestamp[ms,UTC]', 'list<string>',
+    'struct<name: string, tags: list<string>>', ..."""
+    if not isinstance(spec, str): raise TypeError("type names are strings, got %r" % (spec,))
+    raw = spec.strip()
+    if raw.lower().startswith("list<") and raw.endswith(">"): return ("list", _named_type(raw[5:-1]))
+    if raw.lower().startswith("struct<") and raw.endswith(">"):
+        fields = []
+        for f in _split_top(raw[7:-1]):
+            name, sep, t = f.partition(":")
+            if not sep or not name.strip(): raise ValueError("struct field %r needs the form name: type" % f.strip())
+            fields.append((name.strip(), _named_type(t)))
+        if len({n for n, _ in fields}) < len(fields): raise ValueError("duplicate field names in %r" % raw)
+        return ("struct", fields)
+    s = raw.lower().replace(" ", "")
     m = _re.fullmatch(r"decimal\((\d+),(\d+)\)", s)
     if m: return _decimal_type(int(m[1]), int(m[2]))
     m = _re.fullmatch(r"timestamp(?:\[(ms|us|ns)(,utc)?\])?", s)
@@ -1797,7 +1822,8 @@ def _to_phys(t, vals, name):
             if any(len(v) != 16 for v in out): raise ValueError("uuid bytes must be 16 long")
             return out
         if k == "null":
-            if vals: raise TypeError("non-null value in a null column")
+            if vals: raise TypeError("a value in a column that holds only nulls (its type was inferred from a "
+                                     "batch with no values; give its type in types=)")
             return []
     except (TypeError, ValueError, AttributeError, OverflowError) as e:
         cls = type(e) if type(e) in (TypeError, ValueError, OverflowError) else ValueError if isinstance(e, ValueError) else TypeError
@@ -1961,7 +1987,9 @@ def _columns(data):
         out = {}
         for k, v in data.items():
             if not isinstance(k, str): raise TypeError("column names must be strings")
-            out[k] = v.to_list() if isinstance(v, DictionaryColumn) else v
+            if not isinstance(v, (list, array, DictionaryColumn)):
+                v = v.tolist() if hasattr(v, "tolist") else list(v)   # numpy/pandas: Python scalars
+            out[k] = v                          # lists, array.array and DictionaryColumn are taken as they are
         n = {len(v) for v in out.values()}
         if len(n) > 1: raise ValueError("columns have different lengths: %s" % {k: len(v) for k, v in out.items()})
         return out
@@ -1969,6 +1997,43 @@ def _columns(data):
     if rows and not all(isinstance(r, dict) for r in rows): raise TypeError("expected a dict of columns or a list of row dicts")
     keys = list(dict.fromkeys(k for r in rows for k in r))
     return {k: [r.get(k) for r in rows] for k in keys}
+
+_ARRAY_KIND = {"b": "int8", "B": "uint8", "h": "int16", "H": "uint16", "f": "float32", "d": "float64"}
+
+def _array_type(tc, name):
+    """Column type for an array.array, from its typecode."""
+    if tc in _ARRAY_KIND: return _named_type(_ARRAY_KIND[tc])
+    if tc in "ilqILQ":
+        bits = 8 * array(tc).itemsize
+        return _named_type(("int%d" if tc.islower() else "uint%d") % bits)
+    raise TypeError("column %r: array typecode %r is not supported" % (name, tc))
+
+def _array_direct(tc, t):
+    """Can an array with this typecode be stored in column type t without checks?"""
+    if t.kind in ("float32", "float64"): return tc == "f" or (tc == "d" and t.kind == "float64")
+    if not t.kind.startswith(("int", "uint")) or tc not in "bBhHiIlLqQ": return False
+    bits, signed = 8 * array(tc).itemsize, tc.islower()
+    if not t.signed and t.bits >= 32: return False          # stored as the signed type: needs remapping
+    if signed: return t.signed and bits <= t.bits
+    return bits < t.bits if t.signed else bits <= t.bits
+
+def _check_spec(spec, name):
+    """A type given as an object rather than a name: a _WType, ("list", spec) or ("struct", [(name, spec)])."""
+    if isinstance(spec, _WType): return spec
+    if isinstance(spec, tuple) and len(spec) == 2 and spec[0] == "list": _check_spec(spec[1], name); return spec
+    if isinstance(spec, tuple) and len(spec) == 2 and spec[0] == "struct" and isinstance(spec[1], list):
+        for f in spec[1]:
+            if not (isinstance(f, tuple) and len(f) == 2 and isinstance(f[0], str)): break
+            _check_spec(f[1], name)
+        else: return spec
+    raise TypeError("types[%r]: expected a type name such as 'int64' or 'list<string>', got %r" % (name, spec))
+
+def _value_bytes(t, phys):
+    """Rough plain-encoded size of physical values (for row_group_bytes)."""
+    if t.ptype == 6: return sum(map(len, phys)) + 4 * len(phys)
+    if t.ptype == 7: return t.type_length * len(phys)
+    if t.ptype == 0: return len(phys) // 8 + 1
+    return len(phys) * (4 if t.ptype in (1, 4) else 8)
 
 class ParquetWriter:
     """Writes a Parquet file in one or more batches.
@@ -1978,41 +2043,54 @@ class ParquetWriter:
             w.write(more_rows)                  # same columns
 
     The file appears only when the writer closes without an error (it is written
-    to a temporary file and renamed). Types are inferred from the first batch
-    unless given in types, e.g. {"id": "int32", "price": "decimal(10,2)",
-    "tags": "list<string>", "at": "timestamp[ms,UTC]"}.
+    to a temporary file and renamed). Types are inferred from the first batch with
+    rows unless given in types, e.g. {"id": "int32", "price": "decimal(10,2)",
+    "tags": "list<string>", "at": "timestamp[ms,UTC]",
+    "user": "struct<name: string, roles: list<string>>"}. Give types for columns
+    that may hold only nulls in the first batch.
 
-    Defaults are chosen for fast reads with microparquet and other readers:
-    row_group_size rows per row group; data pages of about page_size bytes before
-    compression and at most page_rows rows; statistics and a page index; zstd
-    level 3 (gzip if zstd is unavailable; compression_level=9 or more gives
-    noticeably smaller files of long text for slower writes); dictionary encoding
-    for columns with many repeats (dictionary="auto" decides per column on the
-    first row group and keeps that choice; or True/False, or a list of column
-    names). sort_by sorts each batch by those columns (NaN, then nulls, last) and
-    records the order in the file; for lookups, sort by the column you filter on
-    most.
+    Columns may be lists (or tuples, or anything with tolist(), such as numpy
+    arrays), array.array, or DictionaryColumn, so read(dictionaries=True) output
+    writes straight back. Arrays skip the per-value checks; dictionary values are
+    converted once per entry. (read(arrays=True) gives dates and timestamps as
+    raw numbers: name their types when writing that output back.)
+
+    Batches are buffered: rows go out in row groups of row_group_size rows, or
+    fewer when they reach row_group_bytes (estimated, uncompressed), so many
+    small batches still make full row groups. Data pages are about page_size
+    bytes before compression and at most page_rows rows. Files carry statistics
+    and a page index; zstd level 3 is the default codec (gzip if zstd is
+    unavailable; compression_level=9 or more gives noticeably smaller files of
+    long text for slower writes). Dictionary encoding is used for columns with
+    many repeats (dictionary="auto" decides per column on the first row group
+    and keeps that choice; or True/False, or a list of column names). sort_by
+    sorts the buffered rows before each row group is written (NaN, then nulls,
+    last) and records the order in the file: each row group is sorted, and the
+    file as a whole is sorted when the rows arrive in one batch.
 
     Every batch is validated as it is written: a value of the wrong type or out
-    of range raises TypeError/ValueError and the batch is undone (for file
-    objects that cannot seek, the writer refuses further batches instead)."""
+    of range raises TypeError/ValueError and the batch is undone, as is a batch
+    whose row groups fail to write (for file objects that cannot seek, the
+    writer refuses further batches instead)."""
 
     def __init__(self, dest, types=None, *, sort_by=None, compression="zstd", compression_level=None,
-                 row_group_size=65536, page_size=65536, page_rows=20000, dictionary="auto", metadata=None):
+                 row_group_size=65536, row_group_bytes=128 << 20, page_size=65536, page_rows=20000,
+                 dictionary="auto", metadata=None):
         if compression == "zstd" and _zstd is None and not _cramjam and not _optional("zstandard"):
             compression = "gzip"
         self.codec, self.compress = _compressor(compression, compression_level)
-        if row_group_size < 1 or page_size < 1 or page_rows < 1:
-            raise ValueError("row_group_size, page_size and page_rows must be positive")
+        if min(row_group_size, row_group_bytes, page_size, page_rows) < 1:
+            raise ValueError("row_group_size, row_group_bytes, page_size and page_rows must be positive")
+        self.row_group_bytes = row_group_bytes
         self.page_rows = page_rows
         if not (dictionary in (True, False, "auto") or isinstance(dictionary, (list, tuple, set, frozenset))):
             raise ValueError("dictionary must be True, False, 'auto' or a list of column names")
-        self.types = {k: (_named_type(v) if isinstance(v, str) else v) for k, v in (types or {}).items()}
+        self.types = {k: (_named_type(v) if isinstance(v, str) else _check_spec(v, k)) for k, v in (types or {}).items()}
         self.sort_by = [sort_by] if isinstance(sort_by, str) else list(sort_by or [])
         self.row_group_size, self.page_size, self.dictionary = row_group_size, page_size, dictionary
         self._dict_choice = {}
         self.metadata = dict(metadata or {})
-        self.nodes = self.leaves = None
+        self.nodes = self.leaves = self._buf = self._empty = None
         self.row_groups, self.indexes, self.num_rows = [], [], 0
         self._tmp = None
         if isinstance(dest, (str, os.PathLike)):
@@ -2040,6 +2118,8 @@ class ParquetWriter:
         if self.nodes is not None: return
         for name, vals in cols.items():
             spec = self.types.get(name)
+            if spec is None and isinstance(vals, array): spec = _array_type(vals.typecode, name)
+            elif spec is None and isinstance(vals, DictionaryColumn): spec = _infer(list(vals.dictionary), name)
             if spec is None: spec = _infer(vals, name)
             specs.append((name, spec))
         unknown = set(self.types) - set(cols)
@@ -2056,18 +2136,24 @@ class ParquetWriter:
         self.leaves, self.nodes, self.paths = leaves, nodes, paths
 
     def write(self, data):
-        """Append a batch: a dict of columns (lists, arrays, or read() output) or a list of row dicts."""
+        """Append a batch: a dict of columns (lists, array.array, DictionaryColumn, or
+        read() output) or a list of row dicts. Rows are buffered and written out in
+        row groups of row_group_size rows (or row_group_bytes), not one per batch."""
         if self.f is None: raise ValueError("the writer is closed")
         if self._broken: raise ValueError("an earlier batch failed part way and could not be undone; abort() and start again")
         cols = _columns(data)
-        state = (self.pos, len(self.row_groups), len(self.indexes), self.num_rows, dict(self._dict_choice), self.nodes)
-        try: self._write(cols)
+        state = (self.pos, len(self.row_groups), len(self.indexes), self.num_rows, dict(self._dict_choice), self.nodes,
+                 self._buf_mark())
+        try:
+            self._buffer(cols)
+            self._flush(final=False)
         except BaseException:
             self._undo(state); raise
 
     def _undo(self, state):
-        """Forget a failed batch: cut its bytes off the file and restore the bookkeeping."""
-        pos, nrg, nidx, nrows, choice, nodes = state
+        """Forget a failed batch: cut its bytes off the file, drop its buffered rows
+        and restore the bookkeeping."""
+        pos, nrg, nidx, nrows, choice, nodes, mark = state
         if self.pos != pos:
             try:
                 if self._base is None: raise OSError
@@ -2076,41 +2162,151 @@ class ParquetWriter:
                 self._broken = True; return
         self.pos, self.num_rows, self._dict_choice = pos, nrows, choice
         del self.row_groups[nrg:]; del self.indexes[nidx:]
-        if nodes is None: self.nodes = self.leaves = None
+        if nodes is None: self.nodes = self.leaves = None; self._buf = None
+        elif self._buf is not None: self._buf_truncate(mark)
 
-    def _write(self, cols):
-        if self.nodes is None: self._schema(cols)
+    # -- the row buffer: per leaf (defs, reps, physical values, row starts), plus the
+    #    Python values of the sort_by columns, the row count and an estimated size --
+
+    def _new_buf(self):
+        return {"leaves": [([], [], [], []) for _ in self.leaves], "keys": {s: [] for s in self.sort_by},
+                "rows": 0, "bytes": 0}
+
+    def _buf_mark(self):
+        b = self._buf
+        if b is None: return None
+        return ([tuple(map(len, s)) for s in b["leaves"]], {k: len(v) for k, v in b["keys"].items()}, b["rows"], b["bytes"])
+
+    def _buf_truncate(self, mark):
+        b = self._buf
+        if mark is None: self._buf = self._new_buf(); return
+        lens, klens, b["rows"], b["bytes"] = mark
+        for s, ls in zip(b["leaves"], lens):
+            for lst, n in zip(s, ls): del lst[n:]
+        for k, n in klens.items(): del b["keys"][k][n:]
+
+    def _buffer(self, cols):
+        """Validate a batch and convert it to levels and physical values. Nothing is
+        buffered unless the whole batch converts."""
+        n = len(next(iter(cols.values()))) if cols else 0
+        if self.nodes is None:
+            if not n and cols:                  # nothing to infer types from yet: wait for rows
+                if self._empty is None: self._empty = cols
+                elif list(cols) != list(self._empty):
+                    raise ValueError("batch columns %s differ from the file's %s" % (list(cols), list(self._empty)))
+                return
+            if self._empty is not None and list(cols) != list(self._empty):
+                raise ValueError("batch columns %s differ from the file's %s" % (list(cols), list(self._empty)))
+            self._schema(cols)
+        if self._buf is None: self._buf = self._new_buf()
         names = [n.name for n in self.nodes]
         if list(cols) != names:
             raise ValueError("batch columns %s differ from the file's %s" % (list(cols), names))
-        n = len(next(iter(cols.values()))) if cols else 0
-        if self.sort_by and n:
-            order = list(range(n))
-            for s in reversed(self.sort_by):    # stable sorts, last key first; NaN then nulls go last
-                k = cols[s]
-                good = [i for i in order if k[i] is not None and k[i] == k[i]]
-                if len(good) < n:
-                    rest = [i for i in order if k[i] is None or k[i] != k[i]]
-                    rest = [i for i in rest if k[i] is not None] + [i for i in rest if k[i] is None]
-                else: rest = []
-                good.sort(key=k.__getitem__); order = good + rest
-            cols = {k: [v[i] for i in order] for k, v in cols.items()}
-        for a in range(0, n, self.row_group_size):
-            self._row_group({k: v[a:a + self.row_group_size] for k, v in cols.items()}, min(self.row_group_size, n - a))
-
-    def _row_group(self, cols, nrows):
         sinks = [([], [], [], []) for _ in self.leaves]
         for node in self.nodes:
             vals = cols[node.name]
-            if node.kind == "prim":             # flat column: no recursion needed
-                s = sinks[node.leaf]
-                present = list(map(_op.is_not, vals, repeat(None)))
-                s[0].extend(present); s[1].extend(repeat(0, len(present))); s[2].extend(compress(vals, present))
-                s[3].extend(range(len(present)))
-            else: _shred(node, vals, sinks)
+            if node.kind == "prim":             # flat column: fast paths, no recursion
+                s, t, name = sinks[node.leaf], node.type, node.name
+                if isinstance(vals, array) and _array_direct(vals.typecode, t):
+                    s[0].extend(repeat(1, n)); s[2].extend(vals.tolist())      # values are in range by construction
+                elif isinstance(vals, DictionaryColumn) and None not in vals.dictionary:
+                    idx = vals.indices
+                    if len(idx) and (min(idx) < -1 or max(idx) >= len(vals.dictionary)):
+                        raise ValueError("column %r: dictionary index out of range" % name)
+                    dphys = _to_phys(t, list(vals.dictionary), name)            # each distinct value converted once
+                    present = list(map((-1).__lt__, idx))
+                    s[0].extend(present); s[2].extend(map(dphys.__getitem__, compress(idx, present)))
+                else:
+                    if not isinstance(vals, list): vals = list(vals.to_list() if isinstance(vals, DictionaryColumn) else vals)
+                    present = list(map(_op.is_not, vals, repeat(None)))
+                    s[0].extend(present); s[2].extend(_to_phys(t, list(compress(vals, present)), name))
+                s[1].extend(repeat(0, n)); s[3].extend(range(n))
+            else:
+                vals = vals.to_list() if isinstance(vals, DictionaryColumn) else vals
+                tmp = [([], [], [], []) for _ in self.leaves]
+                _shred(node, vals, tmp)
+                for l in node.leaves:
+                    d, r, v, st = tmp[l]
+                    leaf = self.leaves[l]
+                    sinks[l] = (d, r, _to_phys(leaf.type, v, ".".join(self.paths[l])), st)
+        keys = {}
+        for s in self.sort_by:
+            v = cols[s]
+            keys[s] = v.to_list() if isinstance(v, DictionaryColumn) else v.tolist() if isinstance(v, array) else list(v)
+            if next(nd for nd in self.nodes if nd.name == s).type.ptype in (6, 7):   # memoryview does not sort; copy bytearrays
+                keys[s] = [x if x is None or isinstance(x, (str, bytes, _dec.Decimal, uuid.UUID)) else bytes(x) for x in keys[s]]
+        # everything converted: append to the buffer (or adopt the lists when it is empty)
+        b = self._buf
+        nbytes = sum(_value_bytes(leaf.type, v) + len(d) for (d, r, v, st), leaf in zip(sinks, self.leaves))
+        if not b["rows"]:
+            b["leaves"] = [tuple(map(list, x)) if any(type(y) is not list for y in x) else x for x in sinks]
+            b["keys"] = {s: keys[s] if keys[s] is not cols[s] else list(keys[s]) for s in self.sort_by}
+        else:
+            for (bd, br, bv, bs), (d, r, v, st) in zip(b["leaves"], sinks):
+                off = len(bd); bs.extend(map(off.__add__, st)); bd.extend(d); br.extend(r); bv.extend(v)
+            for s in self.sort_by: b["keys"][s].extend(keys[s])
+        b["rows"] += n; b["bytes"] += nbytes
+
+    def _sorted_buf(self, b):
+        """A copy of buffer b with its rows in sort_by order (stable; NaN, then nulls, last)."""
+        n = b["rows"]; order = list(range(n))
+        for s in reversed(self.sort_by):
+            k = b["keys"][s]
+            good = [i for i in order if k[i] is not None and k[i] == k[i]]
+            if len(good) < n:
+                rest = [i for i in order if k[i] is None or k[i] != k[i]]
+                rest = [i for i in rest if k[i] is not None] + [i for i in rest if k[i] is None]
+            else: rest = []
+            good.sort(key=k.__getitem__); order = good + rest
+        if order == list(range(n)): return b
+        out = {"leaves": [], "keys": {s: list(map(v.__getitem__, order)) for s, v in b["keys"].items()},
+               "rows": n, "bytes": b["bytes"]}
+        for (d, r, v, st), leaf in zip(b["leaves"], self.leaves):
+            if not leaf.r and len(d) == n:      # flat leaf: one level per row
+                vi = list(accumulate(map(leaf.d.__eq__, d), initial=0))
+                d2 = list(map(d.__getitem__, order))
+                v2 = [v[vi[i]] for i in order if d[i] == leaf.d]
+                out["leaves"].append((d2, [0] * n, v2, list(range(n))))
+                continue
+            ends = st[1:] + [len(d)]
+            vi = list(accumulate(map(leaf.d.__eq__, d), initial=0))
+            d2, r2, v2, s2 = [], [], [], []
+            for i in order:
+                a, e = st[i], ends[i]
+                s2.append(len(d2)); d2 += d[a:e]; r2 += r[a:e]; v2 += v[vi[a]:vi[e]]
+            out["leaves"].append((d2, r2, v2, s2))
+        return out
+
+    def _flush(self, final):
+        """Write out full row groups (all buffered rows when final). The buffer is
+        replaced only after every row group of this flush was written."""
+        b = self._buf
+        if b is None or not b["rows"]: return
+        if not final and b["rows"] < self.row_group_size and b["bytes"] < self.row_group_bytes: return
+        if self.sort_by: b = self._sorted_buf(b)
+        n, per_row = b["rows"], max(1, b["bytes"] // max(1, b["rows"]))
+        k = max(1, min(self.row_group_size, self.row_group_bytes // per_row))
+        # value offset at each level position, per leaf (values exist only at max definition level)
+        vis = [list(accumulate(map(leaf.d.__eq__, d), initial=0)) for (d, r, v, st), leaf in zip(b["leaves"], self.leaves)]
+        r0 = 0
+        while n - r0 >= k or (final and r0 < n):
+            r1 = min(n, r0 + k); self._row_group(b, vis, r0, r1); r0 = r1
+        rest = self._new_buf()                  # rows left over wait for the next batch
+        for (d, r, v, st), (rd, rr, rv, rs), vi in zip(b["leaves"], rest["leaves"], vis):
+            if r0 >= n: break
+            e0 = st[r0]
+            rd += d[e0:]; rr += r[e0:]; rv += v[vi[e0]:]; rs += [x - e0 for x in st[r0:]]
+        for s, v in b["keys"].items(): rest["keys"][s] += v[r0:]
+        rest["rows"] = n - r0; rest["bytes"] = b["bytes"] * (n - r0) // n if n else 0
+        self._buf = rest
+
+    def _row_group(self, b, vis, r0, r1):
+        nrows = r1 - r0
         chunks, start, ub, cb = [], self.pos, 0, 0
-        for leaf, (defs, reps, vals, starts) in zip(self.leaves, sinks):
-            meta, ci, oi, u, c = self._chunk(leaf, defs, reps, vals, starts, nrows)
+        for (d, r, v, st), vi, leaf in zip(b["leaves"], vis, self.leaves):
+            e0 = st[r0]; e1 = st[r1] if r1 < len(st) else len(d)
+            v0, v1 = vi[e0], vi[e1]
+            meta, ci, oi, u, c = self._chunk(leaf, d[e0:e1], r[e0:e1], v[v0:v1], [x - e0 for x in st[r0:r1]], nrows)
             chunks.append(meta); self.indexes.append((len(self.row_groups), len(chunks) - 1, ci, oi)); ub += u; cb += c
         sorting = [[(1, _T_I32, next(n.leaf for n in self.nodes if n.name == s)), (2, _T_BOOL, False), (3, _T_BOOL, False)]
                    for s in self.sort_by]
@@ -2128,9 +2324,8 @@ class ParquetWriter:
         off = self.pos; self._out(hdr); self._out(comp)
         return off, len(hdr) + len(body), len(hdr) + len(comp)
 
-    def _chunk(self, leaf, defs, reps, vals, starts, nrows):
+    def _chunk(self, leaf, defs, reps, phys, starts, nrows):
         t, name = leaf.type, ".".join(self.paths[leaf.leaf])
-        phys = _to_phys(t, vals, name)
         maxd, maxr = leaf.d, leaf.r
         dw, rw = maxd.bit_length(), maxr.bit_length()
         # dictionary or plain
@@ -2216,7 +2411,9 @@ class ParquetWriter:
         if self.f is None: return
         if self._broken: self.abort(); raise ValueError("an earlier batch failed part way; no file was written")
         try:
-            if self.nodes is None: self._schema({})
+            if self.nodes is None:              # no rows written: the columns named so far, or in types=
+                self._schema(self._empty or {k: [] for k in self.types})
+            self._flush(final=True)
             ci_pos, oi_pos = {}, {}
             for rg, c, ci, oi in self.indexes:
                 b = _thrift_bytes(ci); ci_pos[rg, c] = (self.pos, len(b)); self._out(b)

@@ -12,7 +12,7 @@ with mpq.ParquetWriter("big.parquet", sort_by=["codeset_id", "ord"]) as w:
     for batch in batches: w.write(batch)                       # same columns each time
 ```
 
-Options: `types`, `sort_by`, `compression` (zstd default, gzip, none; snappy/lz4/brotli with accelerators), `compression_level`, `row_group_size=65536`, `page_size=65536`, `page_rows=20000`, `dictionary="auto"|True|False|[names]`, `metadata={...}`.
+Options: `types`, `sort_by`, `compression` (zstd default, gzip, none; snappy/lz4/brotli with accelerators), `compression_level`, `row_group_size=65536`, `row_group_bytes=128 MB` (session 7), `page_size=65536`, `page_rows=20000`, `dictionary="auto"|True|False|[names]`, `metadata={...}`.
 
 ## What it writes
 
@@ -75,3 +75,44 @@ The name is a trademark question, not copyright. The ASF lists "Parquet" and "Ap
 
 - Optional writer extras: maps, DELTA_BINARY_PACKED for sorted ints, v2 pages, page CRCs, bloom filters (shared xxhash64 with the reader).
 - Faster writes: the remaining time is spread across sorting, RLE and Python value conversion.
+
+## Streaming and columnar input (session 7)
+
+**What changed:**
+- **Buffered row groups.** Each `ParquetWriter.write()` used to make at least one row group of its own, so 1,000-row batches gave a file of 1,000-row groups. Batches are now validated and converted on `write()`, buffered as levels and physical values, and written out as full row groups of `row_group_size` rows.
+- **Byte limit.** `row_group_bytes` (128 MB by default, estimated before compression) caps how much a row group holds, so wide text tables don't hold several hundred MB of rows before a flush. A single row larger than the limit gets a row group of its own.
+- **Sorting.** `sort_by` now sorts the whole buffer before each flush, so each row group is sorted across the batches it came from. One `write()` call still gives a fully sorted file.
+- **Columnar input.** `write()` takes `array.array`, `DictionaryColumn` and anything with `tolist()` (numpy, pandas) directly. Arrays whose typecode fits the column type skip the per-value checks. Dictionary values are converted once per entry. `read(dictionaries=True)` output writes back unchanged: NYC green, SQuAD, MNIST, oasst1 and a fastparquet file all round-tripped value for value.
+- **Other fixes and additions:**
+  - New `struct<name: type, …>` type names, with field-name case kept.
+  - Empty first batches no longer fix column types.
+  - A writer with `types=` and no rows now writes an empty file with those columns.
+  - Type specs that aren't type names or `_WType`s are rejected.
+  - The error for an all-null first batch now says to pass `types=`.
+
+**Atomicity with buffering.** A batch is either fully converted into the buffer or not added at all. The buffer is replaced only after every row group of a flush has been written. If a flush fails part way, from an I/O error or a `KeyboardInterrupt`, the file is truncated back and the buffer restored to its state before that batch.
+
+## Adversarial testing (session 7)
+
+- **`tests/fuzz_writer.py`** is a new fault-injection fuzzer. Each run writes random batches, mixing list, `array.array` and `DictionaryColumn` input and nested columns, under random settings. A quarter of the batches carry a bad value in a random column, and 15% of writes hit a simulated `OSError` or `KeyboardInterrupt` part way through a flush. The resulting file must contain exactly the accepted batches, in order (sorted per flush when `sort_by` is set), and read identically in microparquet and pyarrow. Result: 2,400 runs over 6 seeds, 0 failures.
+- **`tests/writer_adversarial.py`** gained about 60 checks covering:
+  - small batches and full row groups, and bad batches after rows already buffered
+  - flaky writers failing on the 1st, 3rd, 5th or 8th write, and an interrupted flush
+  - sorted nested columns across batches, and the byte limit
+  - every array typecode and its range limits against declared types
+  - `DictionaryColumn` edge cases (out-of-range or negative indices, None entries, wrong types, length mismatch)
+  - empty and all-null first batches, objects with `tolist()`, and malformed struct type names
+- **`tests/writer_roundtrip.py`** now writes half its tables in random batches with random input forms, and checks the row-group sizes.
+
+| Finding | Kind | Fix |
+|---|---|---|
+| `close()` raised `KeyError` when `types=` was given but no rows were written | pre-existing bug | Writes an empty file with the typed columns |
+| An empty first batch fixed every column type as null, so the next real batch failed | pre-existing limitation | Types are inferred from the first batch that has rows |
+| `sort_by` on a binary column given `memoryview` values failed at flush time, which blamed a later batch | new-code bug | Binary sort keys are copied to `bytes` when buffered |
+| The fuzzer flagged `True` as accepted in an int column | test bug | Converting to `array('q')` or a dictionary already turns `True` into `1`; the column carrying the injected value stays a list |
+| In this sandbox, pyarrow hangs at interpreter exit after reading a `BytesIO`, or after a multi-threaded read, when run under `timeout` | environment | Tests read with `pa.BufferReader(..., use_threads=False)` |
+
+**Performance:**
+- 2M int64: `array('q')` writes in 0.77 s, against 1.11 s for a list.
+- 2,000 batches of 1,000 rows with `sort_by` take 0.82 s and produce 31 row groups. Before buffering, the same writes produced 2,000 row groups.
+- Single-batch output is byte-identical to the previous version on all six Harmony tables. Writing those tables takes 9.0 s, against 8.7 s before.

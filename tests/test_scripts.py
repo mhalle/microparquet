@@ -58,6 +58,12 @@ def test_fuzz_filters(tmp_path, writer):
 
 
 @pytest.mark.interop
+@pytest.mark.parametrize("seed", [1, 2])
+def test_fuzz_writer(seed):
+    run("fuzz_writer.py", 150, seed)
+
+
+@pytest.mark.interop
 def test_fuzz_malformed(tmp_path):
     run("writer_roundtrip.py", tmp_path, 12, 5)          # seed files from the writer...
     run("fuzz_filters.py", tmp_path, 6, 5, "pyarrow")    # ...and from pyarrow

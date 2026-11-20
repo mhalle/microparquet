@@ -3,6 +3,7 @@
 # microparquet with random settings, then read back by pyarrow, polars, duckdb,
 # fastparquet (flat columns) and microparquet, and compared with the input.
 import sys, os, random, math, decimal, datetime as dt, uuid, struct, traceback
+from array import array
 sys.path.insert(0, sys.argv[1]); import microparquet as mpq
 import pyarrow.parquet as pq
 out, N = sys.argv[2], int(sys.argv[3]); seed = int(sys.argv[4]) if len(sys.argv) > 4 else 0
@@ -59,6 +60,7 @@ def norm(v):
     return v
 
 fails = 0
+all_forms = []
 def check(label, ok, detail=''):
     global fails
     if not ok:
@@ -75,15 +77,49 @@ for k in range(N):
     sortable = [c for c in data if c in ('i64', 's', 'd', 'ts', 'i32', 'u32', 'u64', 'dec', 'b', 'bin', 'tms', 'tm')]
     if sortable and R.random() < .4: kw['sort_by'] = R.choice(sortable)
     p = os.path.join(out, f'w{seed}_{k}.parquet')
-    label = f'{p} {kw} types={types}'
+    batched = R.random() < .5                    # streaming: random batches and input forms
+    if batched:
+        if 'sort_by' not in kw and R.random() < .5: kw['row_group_bytes'] = R.choice([1, 500, 20000])
+        types = {**{c: mpq._infer(v, c) for c, v in data.items()}, **types}   # the first batch may be all null
+        cuts = sorted({0, n} | {R.randrange(n + 1) for _ in range(R.randint(0, 6))})
+        batches = [(a, b) for a, b in zip(cuts, cuts[1:])] or [(0, 0)]
+        forms = all_forms
+    label = f'{p} {kw} batched={batches if batched else None} types={types}'
+    def as_form(c, v):                           # list, array.array or DictionaryColumn for a batch slice
+        f = R.random()
+        tc = {'i64': 'q', 'f64': 'd', 'i32': 'i', 'u32': 'I', 'u64': 'Q', 'f32': 'f'}.get(c)
+        if tc and None not in v and f < .4 and not (c == 'f64' and any(isinstance(x, int) for x in v)):
+            forms.append((c, 'array')); return array(tc, v)
+        if f > .7 and c not in ('lst', 'lls', 'st', 'msgs', 'sl'):
+            dk = lambda x: ('f', struct.pack('<d', x)) if isinstance(x, float) else x   # keeps -0.0 and NaN apart
+            ix, d = {}, []
+            for x in v:
+                if x is not None and dk(x) not in ix: ix[dk(x)] = len(d); d.append(x)
+            idx = array('i', [-1 if x is None else ix[dk(x)] for x in v])
+            forms.append((c, 'dict')); return mpq.DictionaryColumn(idx, d)
+        return v
     try:
-        mpq.write(p, data, types, **kw)
+        if not batched: mpq.write(p, data, types, **kw)
+        else:
+            with mpq.ParquetWriter(p, types, **kw) as w:
+                for a, b in batches: w.write({c: as_form(c, v[a:b]) for c, v in data.items()})
     except Exception:
         check('write ' + label, False, traceback.format_exc()); continue
-    if 'sort_by' in kw:                          # expected order: stable sort, nulls last
+    if 'sort_by' in kw:                          # expected order: stable sort, nulls last, per flushed buffer
         key = data[kw['sort_by']]
-        order = sorted(range(n), key=lambda i: (key[i] is None, key[i] if key[i] is not None else 0))
+        srt = lambda ix: sorted(ix, key=lambda i: (key[i] is None, key[i] if key[i] is not None else 0))
+        rgs = kw['row_group_size']; order, buf = [], []
+        for a, b in (batches if batched else [(0, n)]):
+            buf += range(a, b)
+            if len(buf) >= rgs:
+                buf = srt(buf); m = len(buf) // rgs * rgs; order += buf[:m]; buf = buf[m:]
+        order += srt(buf)
         expect = {c: [v[i] for i in order] for c, v in expect.items()}
+    if batched and n:                            # row groups: full ones, then the rest
+        md = pq.ParquetFile(p).metadata; sizes = [md.row_group(i).num_rows for i in range(md.num_row_groups)]
+        if 'row_group_bytes' not in kw:
+            check('row group sizes ' + label, sizes == [kw['row_group_size']] * (n // kw['row_group_size']) + ([n % kw['row_group_size']] if n % kw['row_group_size'] else []), sizes)
+        else: check('row group sizes ' + label, sum(sizes) == n and all(sizes), sizes)
     exp = {c: norm(v) for c, v in expect.items()}
     # microparquet
     try:
@@ -140,5 +176,5 @@ for k in range(N):
             pq.write_table(pq.read_table(p), p + '.pa'); fastparquet.ParquetFile(p + '.pa').to_pandas(columns=flat)
             check('fastparquet read ' + label, False, traceback.format_exc()[-600:])
         except Exception: pass                   # pyarrow's file fails the same way: not a writer problem
-print(f'{N} files, {fails} failures')
+print(f'{N} files, {fails} failures; batched inputs used: {dict(__import__("collections").Counter(f for c, f in all_forms))}')
 sys.exit(1 if fails else 0)

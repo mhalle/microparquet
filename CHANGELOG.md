@@ -24,3 +24,12 @@ First release, grown from a 178-line prototype ("tinyparquet").
   statistics, page index, dictionary encoding, zstd/gzip, `sort_by` with
   sorting metadata, strict value checks, undo of rejected batches, and atomic
   file creation. Checked against pyarrow, polars, DuckDB and fastparquet.
+- Streaming: batches are buffered into full row groups (`row_group_size`, plus
+  a `row_group_bytes` cap, 128 MB by default) instead of one row group per
+  `write()`; `sort_by` sorts each row group. A batch whose row groups fail to
+  write (an I/O error, an interrupt) is undone like a rejected one.
+- Columnar input: `array.array`, `DictionaryColumn` and objects with `tolist()`
+  (numpy, pandas), so `read(dictionaries=True)` output writes straight back.
+- `struct<name: type, ...>` type names; empty first batches no longer fix the
+  column types; a writer with `types=` and no rows writes an empty file with
+  those columns.
